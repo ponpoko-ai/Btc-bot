@@ -6,7 +6,7 @@ import ccxt
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK")
 SYMBOL = 'BTC/USDT'
 
-exchange = ccxt.binance({
+exchange = ccxt.bybit({
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'}
 })
