@@ -1,13 +1,15 @@
 import os
 import requests
 import pandas as pd
-import pandas_ta as ta
 import ccxt
 
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK")
 SYMBOL = 'BTC/USDT'
 
-exchange = ccxt.binance()
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'spot'}
+})
 
 TIMEFRAMES = {
     '5m': '5m',
@@ -17,16 +19,36 @@ TIMEFRAMES = {
     'D': '1d'
 }
 
+def calculate_indicators(df):
+    # EMA
+    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+    
+    # BB (20, 2.0)
+    df['bb_middle'] = df['close'].rolling(window=20).mean()
+    df['bb_std'] = df['close'].rolling(window=20).std()
+    
+    # Fast Stoch (14, 3)
+    low_min14 = df['low'].rolling(window=14).min()
+    high_max14 = df['high'].rolling(window=14).max()
+    k_fast = 100 * ((df['close'] - low_min14) / (high_max14 - low_min14))
+    df['stoch_k'] = k_fast.rolling(window=3).mean()
+
+    # Slow Stoch (140, 84)
+    low_min140 = df['low'].rolling(window=140).min()
+    high_max140 = df['high'].rolling(window=140).max()
+    k_slow_raw = 100 * ((df['close'] - low_min140) / (high_max140 - low_min140))
+    df['slow_k'] = k_slow_raw.rolling(window=84).mean()
+    
+    return df
+
 def analyze():
     results = {}
     for tf_display, tf_code in TIMEFRAMES.items():
         ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=tf_code, limit=300)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        # EMA
-        df['ema20'] = ta.ema(df['close'], length=20)
-        df['ema50'] = ta.ema(df['close'], length=50)
-        df['ema200'] = ta.ema(df['close'], length=200)
+        df = calculate_indicators(df)
         
         last = df.iloc[-1]
         prev = df.iloc[-2]
@@ -38,10 +60,7 @@ def analyze():
         dir_l = "↑" if last['ema200'] > prev['ema200'] else "↓"
         ema_str = f"{dir_s}{dir_m}{dir_l}"
 
-        # BB / State
-        bb = ta.bbands(df['close'], length=20, std=2.0)
-        basis = bb['BBM_20_2.0'].iloc[-1]
-        
+        basis = last['bb_middle']
         if last['close'] > basis and last['ema20'] > prev['ema20']:
             state = "TU"
         elif last['close'] < basis and last['ema20'] < prev['ema20']:
@@ -49,14 +68,9 @@ def analyze():
         else:
             state = "RG"
 
-        # Stoch (14,3,3)
-        stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
-        stoch_v = round(stoch.iloc[-1]['STOCHk_14_3_3'], 1)
-
-        # Slow Stoch (140,84,84)
-        slow = ta.stoch(df['high'], df['low'], df['close'], k=140, d=84, smooth_k=84)
-        slow_v = round(slow.iloc[-1]['STOCHk_140_84_84'], 1)
-        slow_prev = slow.iloc[-2]['STOCHk_140_84_84']
+        stoch_v = round(last['stoch_k'], 1)
+        slow_v = round(last['slow_k'], 1)
+        slow_prev = prev['slow_k']
         sdir = "Up" if slow_v > slow_prev else "Dn"
 
         results[tf_display] = {
@@ -67,10 +81,8 @@ def analyze():
 
 def build_commentary(res):
     d, h4, h1, m15, m5 = res['D'], res['4H'], res['1H'], res['15m'], res['5m']
-    
     comments = []
     
-    # 日足
     if d['state'] == 'TU':
         comments.append("・**日足（D）**：強い上昇環境。" + ("ただしStoch高値圏で過熱感あり。" if d['stoch'] > 80 else ""))
     elif d['state'] == 'TD':
@@ -78,7 +90,6 @@ def build_commentary(res):
     else:
         comments.append("・**日足（D）**：レンジ・方向感模索中。")
         
-    # 4時間足
     if h4['state'] == 'TU':
         comments.append("・**4時間足（4H）**：上昇トレンド進行中。押し目買いの基本土台。")
     elif h4['state'] == 'TD':
@@ -86,7 +97,6 @@ def build_commentary(res):
     else:
         comments.append("・**4時間足（4H）**：レンジ構成中。")
         
-    # 1時間足
     if h1['stoch'] < 30:
         comments.append("・**1時間足（1H）**：調整が進み、上位足に対する押し目・買場を形成中。")
     elif h1['stoch'] > 70:
@@ -94,7 +104,6 @@ def build_commentary(res):
     else:
         comments.append("・**1時間足（1H）**：中間圏で推移。")
         
-    # 15m & 5m
     if m5['stoch'] < 20 and m15['sdir'] == 'Up':
         comments.append("・**15m/5m**：短期売られすぎからの反発局面。エントリータイミングを探るゾーン。")
     elif m5['stoch'] > 80:
@@ -102,7 +111,6 @@ def build_commentary(res):
     else:
         comments.append(f"・**15m/5m**：短期Stoch={m5['stoch']}、SDir={m5['sdir']}。")
 
-    # 総評
     if d['state'] == 'TU' and h4['state'] == 'TU':
         if h1['stoch'] < 40 and m5['stoch'] < 30:
             summary = "🔥 **【絶好の押し目買いチャンス】** 上位足が強い上昇トレンドの中、下位足がしっかり調整完了。ロング狙いの優位性が非常に高い局面です。"
@@ -136,6 +144,8 @@ def main():
     msg += f"📝 **各足の短評**\n{comments}\n\n"
     msg += f"💡 **全体総評**\n{summary}"
 
-    requests.post(WEBHOOK_URL, json={'content': msg})
+    if WEBHOOK_URL:
+        requests.post(WEBHOOK_URL, json={'content': msg})
 
-if _
+if __name__ == '__main__':
+    main()
