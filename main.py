@@ -1,148 +1,132 @@
 import os
 import requests
 import pandas as pd
-import ccxt
+import yfinance as yf
 
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK")
-SYMBOL = 'BTC/USDT'
 
-exchange = ccxt.kraken({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-})
-
-TIMEFRAMES = {
-    '5m': '5m',
-    '15m': '15m',
-    '1H': '1h',
-    '4H': '4h',
-    'D': '1d'
+# 監視シンボル (Yahoo Finance Tickers)
+TICKERS = {
+    'BTC': 'BTC-USD',
+    'GOLD': 'GC=F',
+    'DXY': 'DX-Y.NYB',
+    'US10Y': '^TNX',
+    'NAS100': '^IXIC',
+    'EURUSD': 'EURUSD=X',
+    'GBPUSD': 'GBPUSD=X',
+    'USDJPY': 'JPY=X',
+    'EURJPY': 'EURJPY=X',
+    'GBPJPY': 'GBPJPY=X',
+    'EURGBP': 'EURGBP=X'
 }
 
-def calculate_indicators(df):
-    # EMA
-    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+def get_data():
+    data = {}
+    tickers_list = list(TICKERS.values())
+    df_all = yf.download(tickers_list, period='10d', interval='1h', progress=False)['Close']
     
-    # BB (20, 2.0)
-    df['bb_middle'] = df['close'].rolling(window=20).mean()
-    df['bb_std'] = df['close'].rolling(window=20).std()
+    for name, ticker in TICKERS.items():
+        if ticker in df_all.columns:
+            s = df_all[ticker].dropna()
+            ema20 = s.ewm(span=20, adjust=False).mean()
+            ema50 = s.ewm(span=50, adjust=False).mean()
+            
+            # Stochastics (14, 3)
+            low14 = s.rolling(14).min()
+            high14 = s.rolling(14).max()
+            stoch = (100 * ((s - low14) / (high14 - low14))).rolling(3).mean()
+            
+            data[name] = {
+                'price': round(s.iloc[-1], 2),
+                'change_4h': round(((s.iloc[-1] - s.iloc[-5]) / s.iloc[-5]) * 100, 2),
+                'trend': 'Bull' if ema20.iloc[-1] > ema50.iloc[-1] else 'Bear',
+                'stoch': round(stoch.iloc[-1], 1) if not pd.isna(stoch.iloc[-1]) else 50.0
+            }
+    return data
+
+def analyze_macro(data):
+    dxy_trend = data['DXY']['trend']
+    us10y_trend = data['US10Y']['trend']
+    nas_trend = data['NAS100']['trend']
     
-    # Fast Stoch (14, 3)
-    low_min14 = df['low'].rolling(window=14).min()
-    high_max14 = df['high'].rolling(window=14).max()
-    k_fast = 100 * ((df['close'] - low_min14) / (high_max14 - low_min14))
-    df['stoch_k'] = k_fast.rolling(window=3).mean()
-
-    # Slow Stoch (140, 84)
-    low_min140 = df['low'].rolling(window=140).min()
-    high_max140 = df['high'].rolling(window=140).max()
-    k_slow_raw = 100 * ((df['close'] - low_min140) / (high_max140 - low_min140))
-    df['slow_k'] = k_slow_raw.rolling(window=84).mean()
+    # Gold correlation: 通常 DXY↓ & US10Y↓ が追い風
+    gold_env = []
+    if dxy_trend == 'Bear': gold_env.append("ドル安(+) ")
+    else: gold_env.append("ドル高(-) ")
+    if us10y_trend == 'Bear': gold_env.append("金利低下(+) ")
+    else: gold_env.append("金利上昇(-) ")
     
-    return df
+    # BTC correlation: 通常 DXY↓ & NAS100↑ (リスクオン) が追い風
+    btc_env = []
+    if dxy_trend == 'Bear': btc_env.append("ドル安(+) ")
+    else: btc_env.append("ドル高(-) ")
+    if nas_trend == 'Bull': btc_env.append("株高/リスクオン(+) ")
+    else: btc_env.append("株安/リスクオフ(-) ")
 
-def analyze():
-    results = {}
-    for tf_display, tf_code in TIMEFRAMES.items():
-        ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=tf_code, limit=300)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df = calculate_indicators(df)
-        
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        po = "Bull" if last['ema20'] > last['ema50'] > last['ema200'] else ("Bear" if last['ema20'] < last['ema50'] < last['ema200'] else "Mix")
-        
-        dir_s = "↑" if last['ema20'] > prev['ema20'] else "↓"
-        dir_m = "↑" if last['ema50'] > prev['ema50'] else "↓"
-        dir_l = "↑" if last['ema200'] > prev['ema200'] else "↓"
-        ema_str = f"{dir_s}{dir_m}{dir_l}"
+    return "".join(gold_env), "".join(btc_env)
 
-        basis = last['bb_middle']
-        if last['close'] > basis and last['ema20'] > prev['ema20']:
-            state = "TU"
-        elif last['close'] < basis and last['ema20'] < prev['ema20']:
-            state = "TD"
-        else:
-            state = "RG"
-
-        stoch_v = round(last['stoch_k'], 1)
-        slow_v = round(last['slow_k'], 1)
-        slow_prev = prev['slow_k']
-        sdir = "Up" if slow_v > slow_prev else "Dn"
-
-        results[tf_display] = {
-            'state': state, 'po': po, 'ema': ema_str,
-            'stoch': stoch_v, 'slow': slow_v, 'sdir': sdir
-        }
-    return results
-
-def build_commentary(res):
-    d, h4, h1, m15, m5 = res['D'], res['4H'], res['1H'], res['15m'], res['5m']
-    comments = []
+def analyze_forex_distortion(data):
+    # 通貨別のスコアリング (買われすぎ/売られすぎの相対評価)
+    scores = {'USD': 0, 'EUR': 0, 'GBP': 0, 'JPY': 0}
     
-    if d['state'] == 'TU':
-        comments.append("・**日足（D）**：強い上昇環境。" + ("ただしStoch高値圏で過熱感あり。" if d['stoch'] > 80 else ""))
-    elif d['state'] == 'TD':
-        comments.append("・**日足（D）**：下落環境傾向。" + ("Stoch低水準で売られすぎ。" if d['stoch'] < 20 else ""))
-    else:
-        comments.append("・**日足（D）**：レンジ・方向感模索中。")
-        
-    if h4['state'] == 'TU':
-        comments.append("・**4時間足（4H）**：上昇トレンド進行中。押し目買いの基本土台。")
-    elif h4['state'] == 'TD':
-        comments.append("・**4時間足（4H）**：下降トレンド進行中。戻り売りの基本土台。")
-    else:
-        comments.append("・**4時間足（4H）**：レンジ構成中。")
-        
-    if h1['stoch'] < 30:
-        comments.append("・**1時間足（1H）**：調整が進み、上位足に対する押し目・買場を形成中。")
-    elif h1['stoch'] > 70:
-        comments.append("・**1時間足（1H）**：高値圏まで上昇済み。ミクロの過熱に注意。")
-    else:
-        comments.append("・**1時間足（1H）**：中間圏で推移。")
-        
-    if m5['stoch'] < 20 and m15['sdir'] == 'Up':
-        comments.append("・**15m/5m**：短期売られすぎからの反発局面。エントリータイミングを探るゾーン。")
-    elif m5['stoch'] > 80:
-        comments.append("・**15m/5m**：短期買われすぎ。一旦の押し（下げ）を待ちたい場面。")
-    else:
-        comments.append(f"・**15m/5m**：短期Stoch={m5['stoch']}、SDir={m5['sdir']}。")
+    # EUR/USD
+    if data['EURUSD']['stoch'] > 70: scores['EUR'] += 1; scores['USD'] -= 1
+    elif data['EURUSD']['stoch'] < 30: scores['EUR'] -= 1; scores['USD'] += 1
+    
+    # GBP/USD
+    if data['GBPUSD']['stoch'] > 70: scores['GBP'] += 1; scores['USD'] -= 1
+    elif data['GBPUSD']['stoch'] < 30: scores['GBP'] -= 1; scores['USD'] += 1
+    
+    # USD/JPY (JPYは逆数表記)
+    if data['USDJPY']['stoch'] > 70: scores['USD'] += 1; scores['JPY'] -= 1
+    elif data['USDJPY']['stoch'] < 30: scores['USD'] -= 1; scores['JPY'] += 1
+    
+    # EUR/JPY
+    if data['EURJPY']['stoch'] > 70: scores['EUR'] += 1; scores['JPY'] -= 1
+    elif data['EURJPY']['stoch'] < 30: scores['EUR'] -= 1; scores['JPY'] += 1
 
-    if d['state'] == 'TU' and h4['state'] == 'TU':
-        if h1['stoch'] < 40 and m5['stoch'] < 30:
-            summary = "🔥 **【絶好の押し目買いチャンス】** 上位足が強い上昇トレンドの中、下位足がしっかり調整完了。ロング狙いの優位性が非常に高い局面です。"
-        elif m5['stoch'] > 70:
-            summary = "⏳ **【押し目待ち】** 上位足は上昇トレンドですが、短期足が高値圏です。5m/15mのStochが低水準まで下がってきたところを狙うのが安全です。"
-        else:
-            summary = "🟢 **【上昇トレンド継続】** 基本戦略はロング。下位足の反発（SDir Up）を確認して押し目を拾う局面です。"
-    elif d['state'] == 'TD' and h4['state'] == 'TD':
-        if h1['stoch'] > 60 and m5['stoch'] > 70:
-            summary = "🔥 **【絶好の戻り売りチャンス】** 上位足が下落トレンドの中、短期足が買われすぎまで上昇。ショート狙いの優位性が高い局面です。"
-        else:
-            summary = "🔴 **【下落トレンド継続】** 基本戦略は戻り売り。下位足の失速を確認して入る局面です。"
-    else:
-        summary = "🟡 **【様子見・レンジ戦略】** 上位足の方向感が一致していません。無理なトレンドフォローは避け、下位足の引きつけ徹底を推奨。"
+    # GBP/JPY
+    if data['GBPJPY']['stoch'] > 70: scores['GBP'] += 1; scores['JPY'] -= 1
+    elif data['GBPJPY']['stoch'] < 30: scores['GBPJPY'] = 0; scores['JPY'] += 1
 
-    return "\n".join(comments), summary
+    strongest = max(scores, key=scores.get)
+    weakest = min(scores, key=scores.get)
+    
+    distortion_msg = ""
+    if scores[strongest] >= 2 and scores[weakest] <= -2:
+        distortion_msg = f"⚠️ **【歪み検出】** 現在【{strongest}】が強い買われすぎ、【{weakest}】が売られすぎ状態です。`{strongest}/{weakest}` ペアの短期過熱からの逆張り・調整注意局面！"
+    else:
+        distortion_msg = f"バランス推移中（相対強者: {strongest} / 相対弱者: {weakest}）"
+        
+    return distortion_msg, strongest, weakest
 
 def main():
-    res = analyze()
-    comments, summary = build_commentary(res)
+    data = get_data()
+    gold_env, btc_env = analyze_macro(data)
+    distortion_msg, strongest_curr, weakest_curr = analyze_forex_distortion(data)
     
-    table_str = "```\n"
-    table_str += f"{'TF':<5} | {'State':<5} | {'PO':<5} | {'EMA':<5} | {'Stoch':<5} | {'Slow':<5} | {'SDir':<4}\n"
-    table_str += "-" * 50 + "\n"
-    for tf, data in res.items():
-        table_str += f"{tf:<5} | {data['state']:<5} | {data['po']:<5} | {data['ema']:<5} | {data['stoch']:<5.1f} | {data['slow']:<5.1f} | {data['sdir']:<4}\n"
-    table_str += "```"
+    msg = "🌐 **【マーケット・マクロ & 歪み監視レポート】**\n\n"
+    
+    # 1. メイン資産ステータス
+    msg += "📊 **BTC & GOLD 現状**\n"
+    msg += f"・**BTC**: ${data['BTC']['price']} (4H: {data['BTC']['change_4h']}%) | Trend: {data['BTC']['trend']} | Stoch: {data['BTC']['stoch']}\n"
+    msg += f"  ┗ 外部環境 (DXY/NAS): {btc_env}\n"
+    msg += f"・**GOLD**: ${data['GOLD']['price']} (4H: {data['GOLD']['change_4h']}%) | Trend: {data['GOLD']['trend']} | Stoch: {data['GOLD']['stoch']}\n"
+    msg += f"  ┗ 外部環境 (DXY/US10Y): {gold_env}\n\n"
 
-    msg = f"📱 **【BTC/USDT 4時間定期レポート】**\n\n"
-    msg += f"{table_str}\n\n"
-    msg += f"📝 **各足の短評**\n{comments}\n\n"
-    msg += f"💡 **全体総評**\n{summary}"
+    # 2. 相関マクロ指標
+    msg += "📈 **マクロ相関指標 (DXY / US10Y / NAS100)**\n"
+    msg += f"・DXY(ドル指数): {data['DXY']['price']} ({data['DXY']['trend']}) | Stoch: {data['DXY']['stoch']}\n"
+    msg += f"・US10Y(米10年債): {data['US10Y']['price']}% ({data['US10Y']['trend']}) | Stoch: {data['US10Y']['stoch']}\n"
+    msg += f"・NAS100(株価): {data['NAS100']['price']} ({data['NAS100']['trend']}) | Stoch: {data['NAS100']['stoch']}\n\n"
+
+    # 3. 為替（EUR/USD/GBP/JPY）買われすぎ・売られすぎの歪み
+    msg += "💱 **為替（EUR/USD/GBP/JPY）通貨強弱 & 歪み分析**\n"
+    msg += f"・EUR/USD: {data['EURUSD']['price']} (Stoch: {data['EURUSD']['stoch']})\n"
+    msg += f"・GBP/USD: {data['GBPUSD']['price']} (Stoch: {data['GBPUSD']['stoch']})\n"
+    msg += f"・USD/JPY: {data['USDJPY']['price']} (Stoch: {data['USDJPY']['stoch']})\n"
+    msg += f"・EUR/JPY: {data['EURJPY']['price']} (Stoch: {data['EURJPY']['stoch']})\n"
+    msg += f"💡 **歪み判定**: {distortion_msg}\n"
 
     if WEBHOOK_URL:
         requests.post(WEBHOOK_URL, json={'content': msg})
