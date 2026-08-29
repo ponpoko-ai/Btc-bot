@@ -15,27 +15,67 @@ def send_discord(message):
         print(f"Failed to send message: {response.status_code}, {response.text}")
 
 # --- 暗号資産・ゴールド用 フォーマット ---
-def build_asset_report(symbol_name, headline, target_scenario, tf_analysis, change_point, summary_text):
+def build_asset_report(symbol_name, headline, is_changed, old_target, new_target, tf_analysis, change_point, summary_text):
     msg = f"# 📰【{symbol_name}】{headline}\n\n"
-    msg += f"### 🎯 ここから狙いたい目線・シナリオ\n{target_scenario}\n\n"
+    
+    # 🎯 目線・シナリオ
+    msg += "### 🎯 ここから狙いたい目線・シナリオ\n"
+    if is_changed:
+        msg += f"~~【旧目線】{old_target}~~\n↓\n**【変更後】{new_target}**\n\n"
+    else:
+        msg += f"**【目線変わらず】(変更なし)** {new_target}\n\n"
+        
+    # 🕒 時間足分析
     msg += "### 🕒 各時間足の動き\n"
     for tf, desc in tf_analysis.items():
-        msg += f"・**{tf}**: {desc}\n"
-    msg += f"\n### ⚡ 直近の大きな環境変化\n{change_point}\n"
-    msg += f"\n### 📝 総評（外部環境・特記事項）\n{summary_text}\n"
+        if is_changed:
+            msg += f"・**{tf}**: {desc}\n"
+        else:
+            msg += f"・**{tf}**: {desc} (変更なし)\n"
+        
+    # ⚡ 環境変化（変化があった時のみ表示）
+    if is_changed and change_point:
+        msg += f"\n### ⚡ 直近の大きな環境変化\n{change_point}\n"
+        
+    # 📝 総評
+    if is_changed:
+        msg += f"\n### 📝 総評（外部環境・特記事項）\n{summary_text}\n"
+    else:
+        msg += f"\n### 📝 総評（外部環境・特記事項）\n{summary_text} (変更なし)\n"
+        
     return msg
 
-# --- 為替（FX）用 フォーマット（総評に強弱・歪みを統合） ---
-def build_fx_report(pair_name, headline, target_scenario, tf_analysis, change_point, strength_distortion, summary_text):
+# --- 為替（FX）用 フォーマット ---
+def build_fx_report(pair_name, headline, is_changed, old_target, new_target, tf_analysis, change_point, strength_distortion, summary_text):
     msg = f"# 📰【{pair_name}】{headline}\n\n"
-    msg += f"### 🎯 ここから狙いたい目線・シナリオ\n{target_scenario}\n\n"
+    
+    # 🎯 目線・シナリオ
+    msg += "### 🎯 ここから狙いたい目線・シナリオ\n"
+    if is_changed:
+        msg += f"~~【旧目線】{old_target}~~\n↓\n**【変更後】{new_target}**\n\n"
+    else:
+        msg += f"**【目線変わらず】(変更なし)** {new_target}\n\n"
+        
+    # 🕒 時間足分析
     msg += "### 🕒 各時間足の動き\n"
     for tf, desc in tf_analysis.items():
-        msg += f"・**{tf}**: {desc}\n"
-    msg += f"\n### ⚡ 直近の大きな環境変化\n{change_point}\n"
+        if is_changed:
+            msg += f"・**{tf}**: {desc}\n"
+        else:
+            msg += f"・**{tf}**: {desc} (変更なし)\n"
+        
+    # ⚡ 環境変化
+    if is_changed and change_point:
+        msg += f"\n### ⚡ 直近の大きな環境変化\n{change_point}\n"
+        
+    # 📝 総評（強弱歪み含む）
     msg += f"\n### 📝 総評（外部環境・強弱歪み・特記事項）\n"
     msg += f"**【通貨間の強弱・歪み】**\n{strength_distortion}\n\n"
-    msg += f"**【ファンダ・市場環境】**\n{summary_text}\n"
+    if is_changed:
+        msg += f"**【ファンダ・市場環境】**\n{summary_text}\n"
+    else:
+        msg += f"**【ファンダ・市場環境】**\n{summary_text} (変更なし)\n"
+        
     return msg
 
 def main():
@@ -47,9 +87,14 @@ def main():
 
     full_message = f"=============================\n🤖 **マルチアセット戦略レポート** ({time_str})\n=============================\n\n"
 
-    # 1. BTC/USDT
+    # --------------------------------------------------
+    # 1. BTC/USDT (例：変化あり)
+    # --------------------------------------------------
     btc_headline = "4時間足の上昇トレンド継続、2時間足の調整完了を狙う"
-    btc_target = "1時間足での下落フラッグ上抜けを確認後、押し目からのロングエントリーを推奨。直近高値突破を狙う目線。"
+    btc_is_changed = True
+    btc_old_target = "レンジ下限（92,000付近）での様子見・打診買い"
+    btc_new_target = "1時間足での下落フラッグ上抜けを確認後、押し目からのロングエントリーを推奨。"
+    
     btc_tf = {
         "日足": "上昇トレンド継続中（200EMAの上を推移）",
         "4時間足": "レンジ上限ブレイク後の押し目形成中",
@@ -58,13 +103,18 @@ def main():
     btc_change = "4時間足で直近高値を上抜けて上昇ダウが確定。下落シナリオから押し目買い優勢の相場環境へ転換。"
     btc_summary = "株価指数（S&P500・NASDAQ）の強気維持が追い風。米金利低下に伴い暗号資産全体への資金流入が継続しているため、ショートはリスク高。"
     
-    full_message += build_asset_report("BTC/USDT", btc_headline, btc_target, btc_tf, btc_change, btc_summary) + "\n---\n\n"
+    full_message += build_asset_report("BTC/USDT", btc_headline, btc_is_changed, btc_old_target, btc_new_target, btc_tf, btc_change, btc_summary) + "\n---\n\n"
 
+    # --------------------------------------------------
     # 2. ゴールド・為替 (土日はスキップ)
+    # --------------------------------------------------
     if not is_weekend:
-        # GOLD
+        # GOLD (例：変化なし)
         gold_headline = "最高値付近での揉み合い、下抜け時のショート検討"
-        gold_target = "レンジ下限ブレイクを確認してからの戻り売り（ショート）、または明確な押し目買いポイントまで引きつける目線。"
+        gold_is_changed = False
+        gold_old_target = "レンジ内での様子見"
+        gold_new_target = "レンジ下限ブレイクを確認してからの戻り売り（ショート）、または明確な押し目買いポイントまで引きつける目線。"
+        
         gold_tf = {
             "日足": "強気トレンドだが買われすぎ水準",
             "4時間足": "高値圏でのダブルトップ形成懸念",
@@ -73,11 +123,14 @@ def main():
         gold_change = "高値更新の勢いが鈍化し、1時間足レベルでトリプルトップの形状を形成中。"
         gold_summary = "ドルインデックスの上昇と反発が拮抗中。米実質金利の動向に警戒が必要なため、明確なブレイクまでは打診買いを控えるのが吉。"
         
-        full_message += build_asset_report("GOLD (XAU/USD)", gold_headline, gold_target, gold_tf, gold_change, gold_summary) + "\n---\n\n"
+        full_message += build_asset_report("GOLD (XAU/USD)", gold_headline, gold_is_changed, gold_old_target, gold_new_target, gold_tf, gold_change, gold_summary) + "\n---\n\n"
 
         # USD/JPY
         usdjpy_headline = "ドル弱・円強の歪み発生中、4時間足抵抗線からのショート狙い"
-        usdjpy_target = "4時間足の20EMA付近までの戻りを待ってからの戻り売り。下値ターゲットは前回安値付近。"
+        usdjpy_is_changed = True
+        usdjpy_old_target = "155.00付近での押し目買い狙い"
+        usdjpy_new_target = "4時間足の20EMA付近（154.50）までの戻りを待ってからの戻り売り。"
+        
         usdjpy_tf = {
             "日足": "下落トレンドへの転換局面",
             "4時間足": "移動平均線に頭を押さえられる戻り高値形成",
@@ -87,7 +140,7 @@ def main():
         usdjpy_strength = "・通貨強弱: JPY > EUR > USD\n・歪み: クロス円全体で円買い圧力が強く、ドル円の反発が他ペアに比べて抑制されている状態。"
         usdjpy_summary = "日銀の金利見通しと米CPI警戒感によるドル手仕舞いが交錯。欧州時間に向けて円強の動きが加速しやすい。"
         
-        full_message += build_fx_report("USD/JPY", usdjpy_headline, usdjpy_target, usdjpy_tf, usdjpy_change, usdjpy_strength, usdjpy_summary)
+        full_message += build_fx_report("USD/JPY", usdjpy_headline, usdjpy_is_changed, usdjpy_old_target, usdjpy_new_target, usdjpy_tf, usdjpy_change, usdjpy_strength, usdjpy_summary)
     else:
         full_message += "☕ **【週末市場休止のお知らせ】**\n土日のため為替（FX）およびゴールド（コモディティ）市場はクローズしています。週明け月曜朝より分析を再開します。"
 
