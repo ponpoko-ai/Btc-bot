@@ -1,18 +1,19 @@
 import os
 import sys
 
-# 必要なライブラリの自動インストール処理
+# 必要なライブラリの自動インストール
 try:
     import yfinance as yf
     import pandas as pd
     import numpy as np
+    import requests
 except ImportError:
     os.system(f"{sys.executable} -m pip install yfinance pandas numpy requests")
     import yfinance as yf
     import pandas as pd
     import numpy as np
+    import requests
 
-import requests
 import datetime
 
 # --- Discord 送信関数 ---
@@ -21,150 +22,167 @@ def send_discord(message):
     if not webhook_url:
         print("Error: DISCORD_WEBHOOK is not set.")
         return
-    payload = {"content": message}
-    response = requests.post(webhook_url, json=payload)
-    if response.status_code == 204:
-        print("Successfully sent message to Discord.")
+    
+    # Discordの2000文字制限対策
+    if len(message) > 1900:
+        chunks = [message[i:i+1900] for i in range(0, len(message), 1900)]
+        for chunk in chunks:
+            requests.post(webhook_url, json={"content": chunk})
     else:
-        print(f"Failed to send message: {response.status_code}, {response.text}")
+        response = requests.post(webhook_url, json={"content": message})
+        if response.status_code != 204:
+            print(f"Failed to send message: {response.status_code}, {response.text}")
 
-# --- Pine Script相当のテクニカル指標計算エンジン ---
-def calculate_stoch(df, k_len, k_smooth, d_smooth):
+# --- ストキャスティクス計算 ---
+def calc_stoch(df, k_len, k_smooth, d_smooth):
     lowest_low = df['Low'].rolling(window=k_len).min()
     highest_high = df['High'].rolling(window=k_len).max()
-    raw_k = 100 * ((df['Close'] - lowest_low) / (highest_high - lowest_low + 1e-9))
+    denom = highest_high - lowest_low
+    denom = denom.replace(0, np.nan)
+    raw_k = 100 * ((df['Close'] - lowest_low) / denom)
+    raw_k = raw_k.fillna(50)
     stoch_k = raw_k.rolling(window=k_smooth).mean()
     stoch_d = stoch_k.rolling(window=d_smooth).mean()
-    return stoch_d
+    return stoch_d.fillna(50)
 
-def analyze_symbol(ticker, symbol_name):
+# --- 単一銘柄のデータ取得と計算 ---
+def analyze_symbol(ticker):
     try:
-        # データ取得 (日足: 1y, 4H/1H: 60d)
-        df_d = yf.download(ticker, period="1y", interval="1d", progress=False)
-        df_4h = yf.download(ticker, period="60d", interval="1h", progress=False) # 4H代替（1Hをリサンプリング）
-        df_1h = yf.download(ticker, period="60d", interval="1h", progress=False)
+        # yfinance からデータ取得 (auto_adjust=True)
+        df_d = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
+        df_1h = yf.download(ticker, period="60d", interval="1h", progress=False, auto_adjust=True)
 
         if df_d.empty or df_1h.empty:
+            print(f"[{ticker}] Data is empty.")
             return None
 
-        # 4Hデータのリサンプリング
-        df_4h = df_4h.resample('4h').agg({
+        # MultiIndexの解消（Column整理）
+        if isinstance(df_d.columns, pd.MultiIndex):
+            df_d.columns = df_d.columns.get_level_values(0)
+        if isinstance(df_1h.columns, pd.MultiIndex):
+            df_1h.columns = df_1h.columns.get_level_values(0)
+
+        # 4H足の生成 (1Hからのリサンプリング)
+        df_4h = df_1h.resample('4h').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         }).dropna()
 
         res = {}
-        tfs = {'日足': df_d, '4H': df_4h, '1H': df_1h}
+        tfs = {'5m': df_1h, '15m': df_1h, '1H': df_1h, '4H': df_4h, 'D': df_d}
 
         for tf_name, df in tfs.items():
-            if len(df) < 200:
+            if len(df) < 50:
                 continue
 
             close = df['Close']
-            
-            # 1. EMA & PO
+            high = df['High']
+            low = df['Low']
+
+            # EMA & PO (Perfect Order)
             ema20 = close.ewm(span=20, adjust=False).mean()
             ema50 = close.ewm(span=50, adjust=False).mean()
             ema200 = close.ewm(span=200, adjust=False).mean()
 
-            last_c = close.iloc[-1]
-            last_e20 = ema20.iloc[-1]
-            last_e50 = ema50.iloc[-1]
-            last_e200 = ema200.iloc[-1]
+            c_val = float(close.iloc[-1])
+            e20 = float(ema20.iloc[-1])
+            e50 = float(ema50.iloc[-1])
+            e200 = float(ema200.iloc[-1])
 
-            po = "Bull" if (last_e20 > last_e50 > last_e200) else ("Bear" if (last_e20 < last_e50 < last_e200) else "Mix")
+            po = "Bull" if (e20 > e50 > e200) else ("Bear" if (e20 < e50 < e200) else "Mix")
 
-            # 2. BB State
+            # BB State
             basis = close.rolling(20).mean()
             dev = close.rolling(20).std() * 2.0
             upper = basis + dev
             lower = basis - dev
             bandwidth = (upper - lower) / (basis + 1e-9) * 100.0
-            bb_rank = bandwidth.rank(pct=True).iloc[-1] * 100.0
+            bb_rank = float(bandwidth.rank(pct=True).iloc[-1] * 100.0) if len(bandwidth) > 0 else 50.0
 
-            state = "RG"
-            if last_c > basis.iloc[-1] and bb_rank >= 12.0:
-                state = "TU"
-            elif last_c < basis.iloc[-1] and bb_rank >= 12.0:
-                state = "TD"
+            basis_last = float(basis.iloc[-1])
+            if c_val > basis_last and bb_rank >= 12.0:
+                state = "TU" # Trend Up
+            elif c_val < basis_last and bb_rank >= 12.0:
+                state = "TD" # Trend Down
             elif bb_rank <= 6.0:
-                state = "BD"
+                state = "BD" # Build
+            else:
+                state = "RG" # Range
 
-            # 3. Std Stoch (14, 3, 3) & Slow Stoch (140, 84, 84)
-            std_stoch = calculate_stoch(df, 14, 3, 3)
-            slow_stoch = calculate_stoch(df, 140, 84, 84)
+            # Std Stoch (14, 3, 3) & Slow Stoch (140, 84, 84)
+            std_stoch = calc_stoch(df, 14, 3, 3)
+            slow_stoch = calc_stoch(df, 140, 84, 84)
 
-            last_std = std_stoch.iloc[-1] if not np.isnan(std_stoch.iloc[-1]) else 50.0
-            last_slow = slow_stoch.iloc[-1] if not np.isnan(slow_stoch.iloc[-1]) else 50.0
-            prev_slow = slow_stoch.iloc[-2] if not np.isnan(slow_stoch.iloc[-2]) else last_slow
+            last_std = float(std_stoch.iloc[-1])
+            last_slow = float(slow_stoch.iloc[-1])
+            prev_slow = float(slow_stoch.iloc[-2]) if len(slow_stoch) > 1 else last_slow
 
-            slow_dir = "Up" if last_slow > prev_slow else "Dn"
+            slow_dir = "Up" if last_slow > prev_slow else ("Dn" if last_slow < prev_slow else "Flat")
 
             res[tf_name] = {
-                'close': last_c,
-                'po': po,
+                'close': c_val,
                 'state': state,
+                'po': po,
                 'std_stoch': last_std,
                 'slow_stoch': last_slow,
                 'slow_dir': slow_dir
             }
         return res
     except Exception as e:
-        print(f"Error processing {symbol_name}: {e}")
+        print(f"Error in analyze_symbol({ticker}): {e}")
         return None
 
 # --- レポート文章の生成 ---
-def generate_report(symbol_name, data, is_fx=False):
-    if not data or '日足' not in data or '4H' not in data or '1H' not in data:
-        return f"# 📰【{symbol_name}】データ取得失敗\n"
+def generate_report(symbol_name, data):
+    if not data or '1H' not in data or '4H' not in data or 'D' not in data:
+        return f"### 📰【{symbol_name}】データ解析中..."
 
     price = data['1H']['close']
     price_str = f"{price:,.2f}" if price > 10 else f"{price:,.4f}"
 
-    # 見出し作成 (状態判定ベース)
     state_4h = data['4H']['state']
     po_4h = data['4H']['po']
     slow_dir_4h = data['4H']['slow_dir']
 
-    headline = ""
+    # ヘッドライン判定
     if state_4h == "TU" or (po_4h == "Bull" and slow_dir_4h == "Up"):
-        headline = f"4H足強気トレンド進行中。押し目買い優勢（現在値: {price_str}）"
+        headline = "強気トレンド進行中。押し目買い優勢"
     elif state_4h == "TD" or (po_4h == "Bear" and slow_dir_4h == "Dn"):
-        headline = f"4H足下落圧力継続。戻り売り優勢（現在値: {price_str}）"
+        headline = "下落圧力継続。戻り売り優勢"
     elif state_4h == "BD":
-        headline = f"4H足スクイーズ（エネルギー蓄積中）。ブレイク待ち（現在値: {price_str}）"
+        headline = "スクイーズ（エネルギー蓄積中）。ブレイク待ち"
     else:
-        headline = f"レンジ推移・方向感模索局面（現在値: {price_str}）"
+        headline = "レンジ推移・方向感模索局面"
 
-    msg = f"# 📰【{symbol_name}】{headline}\n\n"
+    msg = f"## 📰【{symbol_name}】{headline} (現在値: {price_str})\n"
+    
+    # 時間足分析テーブル風表示
+    msg += "```\n"
+    msg += f"{'TF':<6} | {'State':<5} | {'PO':<5} | {'Stoch':<6} | {'Slow':<6} | {'SDir':<4}\n"
+    msg += "-" * 42 + "\n"
+    for tf in ['1H', '4H', 'D']:
+        if tf in data:
+            d = data[tf]
+            msg += f"{tf:<6} | {d['state']:<5} | {d['po']:<5} | {d['std_stoch']:<6.1f} | {d['slow_stoch']:<6.1f} | {d['slow_dir']:<4}\n"
+    msg += "```\n"
 
-    # 🕒 時間足分析
-    msg += "### 🕒 時間足分析（Pine Fusion Table準拠）\n"
-    for tf in ['日足', '4H', '1H']:
-        d = data[tf]
-        msg += f"・**{tf}**: State [{d['state']}] | PO [{d['po']}] | SlowStoch [{d['slow_stoch']:.1f} ({d['slow_dir']})]\n"
-
-    # ⚔️ ターゲットシナリオ
-    msg += "\n### ⚔️ ターゲットシナリオ\n"
+    # ターゲットシナリオ
+    msg += "**⚔️ ターゲットシナリオ**\n"
     if po_4h == "Bull":
-        msg += f"・🟢 **買い手の狙い**: 1H足のSlowStoch({data['1H']['slow_stoch']:.1f})売られすぎ水準（20以下）からの反発でロング。\n"
-        msg += f"・🔴 **売り手の狙い**: 日足/4H足の過熱感（StdStoch: {data['4H']['std_stoch']:.1f}）を確認しての短期逆張りショート。\n"
+        msg += f"・🟢 **買い手の狙い**: 1H足 SlowStoch ({data['1H']['slow_stoch']:.1f}) の押し目（20近辺）からの反発狙い。\n"
+        msg += f"・🔴 **売り手の狙い**: 4H/日足の高値圏（StdStoch: {data['4H']['std_stoch']:.1f}）での逆張り短期ショート。\n"
     else:
-        msg += f"・🟢 **買い手の狙い**: 1H/4H足での底打ち・Wボトム形成（SlowStoch反転）を確認しての打診買い。\n"
-        msg += f"・🔴 **売り手の狙い**: 1H/4H足EMAラインへの戻り目から、SlowStoch({data['4H']['slow_stoch']:.1f})低下に沿った戻り売り。\n"
+        msg += f"・🟢 **買い手の狙い**: 1H/4H足のSlowStoch反転および底固め確認後の打診買い。\n"
+        msg += f"・🔴 **売り手の狙い**: EMA戻り目および 4H SlowStoch ({data['4H']['slow_stoch']:.1f}) 低下に沿った戻り売り。\n"
 
-    # 📝 総評（ストキャス＆他指標相関）
-    msg += "\n### 📝 総評（MTF Fusion & ストキャス環境）\n"
-    msg += f"・**SlowStoch(140,84,84)**: 日足 [{data['日足']['slow_stoch']:.1f}] / 4H [{data['4H']['slow_stoch']:.1f}] / 1H [{data['1H']['slow_stoch']:.1f}]\n"
-    msg += f"・**StdStoch(14,3,3)**: 4H [{data['4H']['std_stoch']:.1f}] (80以上=買われすぎ / 20以下=売られすぎ)\n"
-
-    # 評価コメント判定
+    # 総評
     slow_4h = data['4H']['slow_stoch']
+    msg += "\n**📝 総評（Pine MTF Fusion 判定）**\n"
     if slow_4h >= 80:
-        msg += "→ 4H足スローストキャスが高値圏（過熱域）に位置。高値更新追撃はリスクが高く、1H足の調整消化を待つのが吉。"
+        msg += "・4H足スローストキャスが**高値圏（過熱域）**です。高値追いは避け、下位足の調整待ちを推奨。\n"
     elif slow_4h <= 20:
-        msg += "→ 4H足スローストキャスが底値圏（売られすぎ域）に位置。売り一巡からの反発・底打ち形成を警戒する局面。"
+        msg += "・4H足スローストキャスが**底値圏（売られすぎ域）**です。売り一巡からの底打ち反発を警戒。\n"
     else:
-        msg += "→ 4H足スローストキャスは中立域を推移。下位足（1H）のセットアップとブレイク方向に追従。"
+        msg += "・4H足スローストキャスは**中立域**を推移。1H足のセットアップと抜け方向に素直に追従。\n"
 
     return msg
 
@@ -175,28 +193,25 @@ def main():
     weekday = now_jst.weekday()
     is_weekend = weekday in [5, 6]
 
-    full_message = f"=============================\n🤖 **マルチアセット戦略レポート** ({time_str})\n=============================\n\n"
+    header_msg = f"=============================\n🤖 **マルチアセット戦略レポート** ({time_str})\n=============================\n\n"
+    send_discord(header_msg)
 
-    # 1. BTC/USDT (Yahoo Finance ticker: BTC-USD)
-    btc_data = analyze_symbol("BTC-USD", "BTC/USDT")
+    # 1. BTC/USDT
+    btc_data = analyze_symbol("BTC-USD")
     if btc_data:
-        full_message += generate_report("BTC/USDT", btc_data) + "\n---\n\n"
+        send_discord(generate_report("BTC/USDT", btc_data))
 
-    # 2. GOLD & USD/JPY (土日はスキップ)
+    # 2. GOLD & USD/JPY (土日以外)
     if not is_weekend:
-        # GOLD (GC=F)
-        gold_data = analyze_symbol("GC=F", "GOLD (XAU/USD)")
+        gold_data = analyze_symbol("GC=F")
         if gold_data:
-            full_message += generate_report("GOLD (XAU/USD)", gold_data) + "\n---\n\n"
+            send_discord(generate_report("GOLD (XAU/USD)", gold_data))
 
-        # USD/JPY (JPY=X)
-        usdjpy_data = analyze_symbol("JPY=X", "USD/JPY")
+        usdjpy_data = analyze_symbol("JPY=X")
         if usdjpy_data:
-            full_message += generate_report("USD/JPY", usdjpy_data, is_fx=True)
+            send_discord(generate_report("USD/JPY", usdjpy_data))
     else:
-        full_message += "☕ **【週末市場休止のお知らせ】**\n土日のため為替（FX）およびゴールド（コモディティ）市場はクローズしています。週明け月曜朝より分析を再開します。"
-
-    send_discord(full_message)
+        send_discord("☕ **【週末市場休止】**\n土日のためFX・ゴールド市場はクローズ中です。週明け月曜朝より配信を再開します。")
 
 if __name__ == "__main__":
     main()
