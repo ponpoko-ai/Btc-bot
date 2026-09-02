@@ -22,19 +22,28 @@ def send_discord(message=None, image_path=None):
     if image_path and os.path.exists(image_path):
         files["file"] = open(image_path, "rb")
 
-    if files:
-        response = requests.post(webhook_url, data=payload, files=files)
-    else:
-        response = requests.post(webhook_url, json=payload)
+    try:
+        if files:
+            response = requests.post(webhook_url, data=payload, files=files)
+        else:
+            response = requests.post(webhook_url, json=payload)
 
-    if response.status_code not in [200, 204]:
-        print(f"Failed to send message: {response.status_code}, {response.text}")
+        if response.status_code not in [200, 204]:
+            print(f"Failed to send message: {response.status_code}, {response.text}")
+    except Exception as e:
+        print(f"Discord send error: {e}")
+    finally:
+        if "file" in files:
+            files["file"].close()
 
 # --- 1. HTF Map & Stoch Cloud 計算 ---
 def analyze_stoch_hub(ticker):
     try:
         df_d = yf.download(ticker, period="60d", interval="1d", progress=False, auto_adjust=True)
         df_4h_raw = yf.download(ticker, period="60d", interval="1h", progress=False, auto_adjust=True)
+
+        if df_d.empty or df_4h_raw.empty:
+            return None
 
         if isinstance(df_d.columns, pd.MultiIndex):
             df_d.columns = df_d.columns.get_level_values(0)
@@ -45,13 +54,13 @@ def analyze_stoch_hub(ticker):
 
         # HTF 14 Range (D & 4H)
         htf_k = 14
-        d_hi = df_d['High'].rolling(htf_k).max().iloc[-1]
-        d_lo = df_d['Low'].rolling(htf_k).min().iloc[-1]
+        d_hi = float(df_d['High'].rolling(htf_k).max().iloc[-1])
+        d_lo = float(df_d['Low'].rolling(htf_k).min().iloc[-1])
         zD80 = d_lo + 0.80 * (d_hi - d_lo)
         zD20 = d_lo + 0.20 * (d_hi - d_lo)
 
-        h4_hi = df_4h['High'].rolling(htf_k).max().iloc[-1]
-        h4_lo = df_4h['Low'].rolling(htf_k).min().iloc[-1]
+        h4_hi = float(df_4h['High'].rolling(htf_k).max().iloc[-1])
+        h4_lo = float(df_4h['Low'].rolling(htf_k).min().iloc[-1])
         z4H80 = h4_lo + 0.80 * (h4_hi - h4_lo)
         z4H20 = h4_lo + 0.20 * (h4_hi - h4_lo)
 
@@ -65,7 +74,7 @@ def analyze_stoch_hub(ticker):
 
         last_k = float(stoch_k.iloc[-1])
         last_d = float(stoch_d.iloc[-1])
-        prev_k = float(stoch_k.iloc[-2])
+        prev_k = float(stoch_k.iloc[-2]) if len(stoch_k) > 1 else last_k
 
         cur_price = float(c_close.iloc[-1])
 
@@ -139,4 +148,83 @@ def generate_currency_strength():
                 d.columns = d.columns.get_level_values(0)
             df_all[p_sym] = d['Close']
 
-        # 累積累積変動率か
+        # 累積変動率から相対強弱を算出
+        returns = df_all.pct_change().fillna(0)
+        c_returns = (1 + returns).cumprod() - 1
+
+        strength = pd.DataFrame(index=c_returns.index)
+        strength['USD'] = -c_returns['EURUSD=X'] - c_returns['GBPUSD=X'] - c_returns['AUDUSD=X'] + c_returns['USDJPY=X']
+        strength['EUR'] = c_returns['EURUSD=X'] + c_returns['EURJPY=X']
+        strength['GBP'] = c_returns['GBPUSD=X'] + c_returns['GBPJPY=X']
+        strength['JPY'] = -c_returns['USDJPY=X'] - c_returns['EURJPY=X'] - c_returns['GBPJPY=X']
+
+        # 通貨強弱グラフの描画
+        plt.figure(figsize=(8, 4))
+        plt.plot(strength.index, strength['USD'], label='USD', color='blue')
+        plt.plot(strength.index, strength['EUR'], label='EUR', color='orange')
+        plt.plot(strength.index, strength['GBP'], label='GBP', color='green')
+        plt.plot(strength.index, strength['JPY'], label='purple')
+        plt.title("Currency Strength (Today)")
+        plt.legend(loc='upper left')
+        plt.grid(True, linestyle='--', alpha=0.5)
+
+        img_path = "currency_strength.png"
+        plt.savefig(img_path, bbox_inches='tight')
+        plt.close()
+
+        # 最新順位の判定
+        last_str = strength.iloc[-1].sort_values(ascending=False)
+        strongest = last_str.index[0]
+        weakest = last_str.index[-1]
+
+        comment = f"**📊 本日の通貨強弱解説**\n"
+        comment += f"・最買われ通貨: **{strongest}** / 最売られ通貨: **{weakest}**\n"
+        comment += f"・現在、`{strongest}/{weakest}` のペアで最も明確なトレンドが発生しやすい環境です。"
+
+        return img_path, comment
+    except Exception as e:
+        print(f"Error generate_currency_strength: {e}")
+        return None, "通貨強弱の生成に失敗しました。"
+
+# --- メイン処理 ---
+def main():
+    now_jst = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+    time_str = now_jst.strftime("%Y-%m-%d %H:%M JST")
+
+    # Header
+    msg = f"=============================\n📢 **市場戦略定期レポート** ({time_str})\n=============================\n\n"
+
+    # 1. Stoch Hub 分析 (BTC, GOLD, USDJPY)
+    symbols = {"BTC/USDT": "BTC-USD", "GOLD (XAU)": "GC=F", "USD/JPY": "JPY=X"}
+    msg += "### 🎯 **Stoch Hub + HTF 80/20 ゾーン変化**\n"
+
+    large_changes = []
+
+    for name, ticker in symbols.items():
+        res = analyze_stoch_hub(ticker)
+        if res:
+            p_str = f"{res['price']:,.2f}" if res['price'] > 10 else f"{res['price']:,.4f}"
+            msg += f"・**{name}** ({p_str})\n"
+            msg += f"  - 日足ゾーン: `{res['zone_d']}` | 4Hゾーン: `{res['zone_4h']}`\n"
+            msg += f"  - Stoch Cloud: K `{res['stoch_k']:.1f}` / D `{res['stoch_d']:.1f}` (前枠差: `{res['k_change']:+.1f}`)\n"
+
+            if abs(res['k_change']) >= 15.0:
+                large_changes.append(f"⚠️ **{name}**: Stoch Kが `{res['k_change']:+.1f}` ポイントの急変を検出！")
+
+    if large_changes:
+        msg += "\n**🔥 大きく変化した銘柄**\n" + "\n".join(large_changes) + "\n"
+
+    msg += "\n---\n\n"
+
+    # 2. 相関分析
+    msg += analyze_correlations() + "\n\n---\n\n"
+
+    # 3. 通貨強弱 (画像付き)
+    img_path, strength_comment = generate_currency_strength()
+    msg += strength_comment
+
+    # Discord送信
+    send_discord(message=msg, image_path=img_path)
+
+if __name__ == "__main__":
+    main()
